@@ -146,7 +146,7 @@ class IgnoreBulkGeneratorFilter( GeneratorFilter ):
             return False
         return True
 
-#This is a usefvl filter to adds textual strings for each of the transactions
+#This is a useful filter to adds textual strings for each of the transactions
 #based on how they would be represented as *simple* commands
 #IE filterDecoration for a 2 byte usb control write
 #becomes: write_config<uint16_t>(bRequest, wValue, wIndex, writeValue)
@@ -232,6 +232,12 @@ class BasicCommandTextFilter( Filter, CapCounterDecorator ):
         elif transaction.type==USBTransaction.BULK:
             transaction.filterDecoration="\t//BULK TRANSFER %s %s" % (self.textDirection(transaction), self.capInfo(transaction))
         elif transaction.type==USBTransaction.CONTROL:
+
+            if (transaction.bmRequestType >> 5 ) & 3 != 2:
+                return [] #Ignore all transactions that are not
+                          #Vendor transactions. IE, filter out
+                          #Setup and control stuff.
+
             read=(transaction.bmRequestType >> 7) != 0
 
             length=transaction.wLength;
@@ -287,9 +293,16 @@ class FilterConfiguration( object ):
         return currentData #Returns iterable object.
 
 #Here's a FilterConfiguration  that turns an input text file into transactions
-ConvertDumpFileToCompletedTransactions=FilterConfiguration( 
-    filterClassChain = [ usbparse.DumpIterator, 
+ConvertWiresharkDumpFileToCompletedTransactions=FilterConfiguration( 
+    filterClassChain = [ usbparse.DumpWiresharkIterator, 
                          usbparse.CapturePointIterator,
                          usbparse.CompletedTransactionIterator ]
 )
+
+ConvertVizslaDumpFileToCompletedTransactions=FilterConfiguration(
+    filterClassChain = [ usbparse.DumpVizslaIterator, 
+                         usbparse.CapturePointIterator,
+                         usbparse.CompletedTransactionIterator ]
+)
+
 

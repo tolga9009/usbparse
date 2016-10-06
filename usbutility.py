@@ -25,6 +25,13 @@ def debyteify( data ):
         value |= data[i]
     return value 
 
+#Big endian turning value into bytes
+def byteify( value, length ):
+    bytes=[]
+    for i in range(length-1, -1, -1):
+        bytes.append( (value >> (i*8)) & 0xff)
+    return bytes
+
 #The mask sets what bits need to match,
 #All 3 fields must be the same length.
 def buffer_match( dataA, dataB, mask ):

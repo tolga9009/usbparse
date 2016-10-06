@@ -1,8 +1,10 @@
-from usbutility import debyteifyLittleEndian, valueOrDefault
+from usbutility import debyteifyLittleEndian, debyteify, byteify, valueOrDefault
+import sys
 
 #For specifying URB format
 Linux=0
 USBPcap=1
+Vizsla=2
 
 class CaptureError(Exception):
     def __init__(self, message):
@@ -23,7 +25,8 @@ class CapturePoint(object):
     DataStage=0x1
     StatusStage=0x2
 
-    def __init__(self, buffer, format=USBPcap, capCounter=None): # buffer is complete buffer grabbed from capture.
+    #buffer is complete buffer grabbed from capture.
+    def __init__(self, buffer, format=USBPcap, capCounter=None, capBase=0): 
         self.format=format
         self.rawData=buffer
         self.capCounter=capCounter
@@ -36,6 +39,7 @@ class CapturePoint(object):
                                 #format for last buffer capture buf of a complete USBTransaction
                                 #Most buffers types are solo in this format,
                                 #so defaults to True
+            self.controlDataFlag = False
  
             urbLength=debyteifyLittleEndian(buffer[0:2])
             if (urbLength < 27) or (urbLength > len(buffer)):
@@ -48,25 +52,24 @@ class CapturePoint(object):
             self.deviceID=debyteifyLittleEndian(buffer[19:21])
             self.endPoint=buffer[21]
             self.direction=(buffer[21]>>7) != 0
+            
             self.type=buffer[22] 
             packetDataLength=debyteifyLittleEndian(buffer[23:27])
             
             if (packetDataLength + urbLength) != len(buffer):
                 if (packetDataLength + urbLength <= 65535): #Capture gets truncated apparently
-                    print packetDataLength
-                    print urbLength
-                    print len(buffer)
                     raise CaptureFormatError("Data is in wrong format")
-
+        
             if self.type == USBTransaction.CONTROL:
-                self.initialFlag = False #Control transactions generate 3 capture events.
-                self.endFlag = False #Control transactions generate 3 capture events.
+                self.initialFlag = False #Control transactions generate 3 capture events, gotta figure out which
+                self.endFlag = False #Control transactions generate 3 capture, gotta figure out which
                 self.controlTransferStage=buffer[27] #This is unique to USBPcap
                 if self.controlTransferStage==CapturePoint.SetupStage:
                     self.initialFlag = True #Only SetupStage is an initial even for a control transaction
                     auxLength=8 #Size of setup stuff.
                     controlData=buffer[urbLength:urbLength+8]
                     self.setupControl(controlData)
+                    self.controlDataFlag=True
                 if self.controlTransferStage==CapturePoint.StatusStage:
                     self.endFlag=True
 
@@ -110,10 +113,12 @@ class CapturePoint(object):
             self.usbdStatus=debyteifyLittleEndian(urb[28:32]) 
             extraPacketLength=debyteifyLittleEndian(urb[36:40])
 
+            self.controlDataFlag=False
             if self.type == USBTransaction.CONTROL:
                 if self.urbType == 'S':
                     controlData=urb[40:48]
                     self.setupControl(controlData)
+                    self.controlDataFlag=True
 
             self.mainWriteFlag = (self.direction == USBTransaction.Outbound) and \
                  (self.urbType == 'S')
@@ -125,6 +130,62 @@ class CapturePoint(object):
             if (urbLength + self.payloadLength) != len(buffer):
                 raise CaptureFormatError("Data is in wrong format")
 
+        elif format==Vizsla:
+            urbLength=8 #Simulated urb created by DumpVizslaIterator
+            #URB definition
+            #entry 0 is deviceID
+            #entry 1 is endPoint ....bit 7 is set to direction.
+            #entry 2 is type..IE USBTransaaction.CONTROL, etc.
+            #entry 3 is 0 if SETUP, 1 if anything else. 
+            #entry 4-7 is 32 bit line number.
+            self.capCounter=debyteify( buffer[4:8] )+capBase
+           
+            if urbLength > len(buffer):
+                raise CaptureFormatError("Data is in wrong format")
+            urb=buffer[:urbLength]
+            self.urb=urb
+ 
+            self.busID=None #Unknown in Vizsla captures.
+            self.deviceID=urb[0]
+            self.endPoint=urb[1]
+            self.type = urb[2]
+            self.direction = (self.endPoint >> 7) != 0
+            self.urbStage=urb[3] #0 if SETUP, 1 if IN or OUT, 2 if end of SETUP.
+
+            self.controlDataFlag=False
+            if self.type == USBTransaction.CONTROL:
+                if self.urbStage==0:
+                    self.controlDataFlag=True
+                    controlData=buffer[urbLength:]
+                    self.setupControl(controlData)
+            if self.urbStage!=1:
+                self.payloadLength=0
+                self.payload=[]
+            else:
+                self.payload=buffer[urbLength:]
+                self.payloadLength=len(self.payload)
+
+            self.initialFlag=True
+            self.endFlag=True
+            self.mainWriteFlag = (self.direction == USBTransaction.Outbound)
+            self.mainReadFlag = (self.direction == USBTransaction.Inbound) 
+ 
+            if self.type == USBTransaction.CONTROL:
+                if self.urbStage==0:                    
+                    self.endFlag=False
+                    #Not at main read or write yet.
+                    self.mainWriteFlag = False
+                    self.mainReadFlag = False 
+                elif self.urbStage==1:
+                    self.initialFlag=False
+                    self.endFlag=False
+                else:
+                    self.initialFlag=False
+                    self.mainWriteFlag = False
+                    self.mainReadFlag = False 
+
+            #For all others, both initial and endflag are true..
+            
     def setupControl(self, controlData):
         self.controlData=controlData
         self.bmRequestType=controlData[0]
@@ -140,9 +201,9 @@ class USBTransaction(object):
     INTERRUPT=0x1
     CONTROL=0x2
     BULK=0x3
+    ISOCHRONOUS=0x4
     CUSTOM="CUSTOM"
     END=-1 #used for sentinel trabsaction
-
 
     #Used for .direction
     Inbound=1
@@ -183,7 +244,7 @@ class USBTransaction(object):
             raise CaptureOrderError( "First capture data passed to USBTransaction not beginning of transaction.",
                                       None,
                                       capturePoint )
- 
+
         #Copy things that do not vary during the transaction
         self.type = capturePoint.type
         self.endPoint = capturePoint.endPoint
@@ -191,7 +252,7 @@ class USBTransaction(object):
         self.deviceID = capturePoint.deviceID
         self.busID = capturePoint.busID
 
-        if self.type == USBTransaction.CONTROL:
+        if (self.type == USBTransaction.CONTROL) and (capturePoint.controlDataFlag):
             self.controlData=capturePoint.controlData
             self.bmRequestType=capturePoint.bmRequestType
             self.bRequest=capturePoint.bRequest
@@ -199,6 +260,14 @@ class USBTransaction(object):
             self.wIndex=capturePoint.wIndex
             self.wLength=capturePoint.wLength
             self.direction=capturePoint.direction
+
+        if (self.direction == USBTransaction.Outbound):
+            self.writtenData=[]
+            self.payload=[]
+        if (self.direction == USBTransaction.Inbound):
+            self.readData=[]
+            self.payload=[]
+
         self.update(capturePoint)           
 
     #Define special END transaction used as sentinel value
@@ -240,7 +309,7 @@ class USBTransaction(object):
             if (capturePoint.endPoint != lastCapturePoint.endPoint) or \
                 (capturePoint.deviceID != lastCapturePoint.deviceID) or \
                 (capturePoint.busID != lastCapturePoint.busID):
-                raise CaptureOrderError("USBTransaction continue method used when not continuing on same endpoint.",
+                raise CaptureOrderError("USBTransaction continue method used when not continuing on same endPoint.",
                                         self,
                                         capturePoint)
 
@@ -248,11 +317,11 @@ class USBTransaction(object):
         #Start grab from fragment
         self.capturePoints.append(capturePoint)
         if (capturePoint.direction == USBTransaction.Outbound) and capturePoint.mainWriteFlag:
-            self.writtenData=capturePoint.payload
-            self.payload=capturePoint.payload
+            self.writtenData+=capturePoint.payload
+            self.payload+=capturePoint.payload
         if (capturePoint.direction == USBTransaction.Inbound) and capturePoint.mainReadFlag:
-            self.readData=capturePoint.payload
-            self.payload=capturePoint.payload
+            self.readData+=capturePoint.payload
+            self.payload+=capturePoint.payload
         self.completed=capturePoint.endFlag           
         #END grab from fragment.
         
@@ -335,10 +404,10 @@ USBTransaction.END_TRANSACTION=USBTransaction.makeCustom(type=USBTransaction.END
 #This creates an iterator for Wireshark Packet Dissections
 #dumped as a plain text file, where the Packet Format is "Packet bytes"
 #checked only.
-#a=DumpIterator(fileName) will give you an iterator that each time you
+#a=DumpWiresharkIterator(fileName) will give you an iterator that each time you
 #read from it you will get a python list containing the bytes of the 
 #packet
-class DumpIterator(object):
+class DumpWiresharkIterator(object):
     #The kwArgs are theree so this can be use in a quicly
     #enumerated list of iterators that are chained together
     #where the parameters for all the settings
@@ -390,10 +459,272 @@ class DumpIterator(object):
                 value=int(number.strip(),16)
                 packetData.append(value)
 
+#This has no error checking so beware.
+class DumpVizslaIterator(object):
+    #The kwArgs are there so this can be use in a quicly
+    #enumerated list of iterators that are chained together
+    #where the parameters for all the settings
+    #are passed to all the iterators.
+    #
+    #data is a filename, but we use the name data so
+    #as to not pollute our parameter namespace for 
+    #filter chains.
+    def __init__(self, data, **kwArgs):
+        self.lines=open(data).xreadlines()
+        self.tripleState=0
+        self.tripleBuffer=[]
+        self.lineNumber=0
+        self.deviceInfo={}
+        self.endPointStates={0x0:[USBTransaction.CONTROL, 0, 0, []]} #2nd entry is state. 
+                                                                     #0= ready for new command
+                                                                     #1= getting data phase.
+                                                                     #3rd is direction. which is fixed for all but control
+                                                                     #endPoints.
+                                                                   #4th is stored triples.
+        self.configurations={}
+        self.currentConfig=None
+        self.interfaceID=0
+ 
+    def __iter__(self):
+        return self
+
+    def next(self):
+        while True: #Return is what ends it.
+            try:
+                line=self.lines.next() 
+                self.lineNumber += 1
+            except StopIteration,e:
+                raise StopIteration()
+
+            if line.strip()=="":
+                continue
+
+            data=line.split("]", 4)
+            if len(data) != 4:
+                raise CaptureFormatError("Bad Vizsla capture format")
+            data=data[3].strip()
+            information=data.split(":",1)
+            keyword=information[0].strip()
+            if keyword=="":
+                continue #Keywordless line.
+         
+            if self.tripleState==0: 
+                if (keyword=="SETUP") or (keyword=="IN") or (keyword=="OUT") or (keyword=="PING"):
+                    self.tripleBuffer.append(information)
+                    self.tripleState=1 
+                    self.tripleStartLineNumber=self.lineNumber 
+                else:
+                    raise CaptureFormatError("Invalid keyword order");
+            elif self.tripleState==1:
+                if (self.tripleBuffer[-1][0].strip() != "PING"):
+                    if (keyword=="NAK"):
+                        self.tripleState=0
+                        self.tripleBuffer=[]
+                    elif keyword.startswith("DATA"):   
+                        self.tripleBuffer.append(information)
+                        self.tripleState=2
+                    elif (keyword=="STALL"):
+                        returnValue=self.processTriple( self.tripleBuffer, self.tripleStartLineNumber )
+                        self.tripleState=0
+                        self.tripleBuffer=[]
+                        if returnValue != None:
+                            return returnValue
+                    else:
+                        raise CaptureFormatError("Invalid keyword order");
+                else:
+                    if (keyword=="ACK") or (keyword=="NAK") or (keyword=="STALL"):
+                        returnValue=self.processTriple( self.tripleBuffer, self.tripleStartLineNumber )
+                        self.tripleState=0
+                        self.tripleBuffer=[]
+                        if returnValue != None:
+                            return returnValue
+                    else:
+                        raise CaptureFormatError("Invalid keyword order");
+
+            elif self.tripleState==2:
+                if (keyword=="NAK") or (keyword=="ACK") or (keyword=="NYET"):
+                    self.tripleBuffer.append(information)
+                    #Okay, we have data to process.
+                    returnValue=self.processTriple( self.tripleBuffer, self.tripleStartLineNumber )
+                    self.tripleState=0
+                    self.tripleBuffer=[]
+                    if returnValue != None:
+                        return returnValue
+                else:
+                    raise CaptureFormatError("Invalid keyword order");
+
+                       
+    def processTriple(self, tripleBuffer, line):
+        transaction = tripleBuffer[0][0].strip()
+        target=tripleBuffer[0][1].strip()
+        textDeviceID, textEndpoint = target.split(".",2)
+        deviceID=int(textDeviceID)
+        endPoint=int(textEndpoint)
+
+        lastCommand=tripleBuffer[-1][0].strip()
+
+        #For now we don't worry about NYETS, we assume eventually acked.
+        if (lastCommand=="STALL"):
+            #Kill transaction
+            self.endPointStates[endPoint][1] = 0 #Reset endPoint state.
+            self.endPointStates[endPoint][3]=[]
+            return None
+        elif (lastCommand=="NAK"):
+            return None #Don't kill transaction though,
+                        #there are cases where it resumes with retry.
+
+        #We also don't worry about PING
+        firstCommand=tripleBuffer[0][0].strip()
+        if (firstCommand=="PING"):
+            return None
+
+        #otherwise it is data.
+        textData=tripleBuffer[1][1].strip()
+        textBytes=textData.split()
+        bytes=[]
+        for textByte in textBytes:
+            bytes.append( int(textByte, 16) )
+        #Drop last 2, it is a CRC.
+        bytes=bytes[:-2]
+
+        #Keep track of transactions so we can parse critical ones.
+        if transaction == "SETUP":
+            self.endPointStates[endPoint][1] = 1 #Setup sent
+            self.endPointStates[endPoint][2] = bytes[0]>>7 #Grab direction from bmRequest.
+            self.endPointStates[endPoint][3] = [[ transaction, deviceID, endPoint, bytes ]]
+            stage=0
+
+        elif len(bytes)==0:    
+            #Multiple transaction control over.       
+            self.checkForSpecialTransaction( self.endPointStates[endPoint][3] ) 
+                                     
+            self.endPointStates[endPoint][1] = 0
+            self.endPointStates[endPoint][3] = []
+            stage=2
+        elif self.endPointStates[endPoint][1] == 1:
+            self.endPointStates[endPoint][3].append([transaction, deviceID, endPoint, bytes])
+            stage=1
+        else:
+            stage=1
+        return self.getCaptureBlock( deviceID, endPoint, bytes, stage, self.tripleStartLineNumber )
+
+    def getCaptureBlock( self, deviceID, endPoint, bytes, stage, lineNumber ):
+        #FAKE Vizsla URB definition:
+        #  byte 0 is deviceID
+        #  byte 1 is endPoint ....bit 7 is set to direction.
+        #  byte 2 is type..IE USBTransaaction.CONTROL, etc.
+        #  byte 3 is 0 if SETUP, 1 if anything else, 2 for END SETUP/ACK. 
+        # byte 4-7 is 32 bit line number
+        
+        if self.endPointStates.has_key( endPoint ):
+            direction = self.endPointStates[endPoint][2]
+            urbEndPoint = endPoint
+            if direction:
+                urbEndPoint |= 0x80
+            urb =[ deviceID, urbEndPoint, self.endPointStates[endPoint][0], stage ]
+            urb += byteify( lineNumber, 4 )
+            return urb+bytes 
+        else:
+            return None
+
+    def checkForSpecialTransaction(self, packets):
+        #We look for the device setup so we can
+        #properly instrument captured packets urb.
+        #and determine what type of transfer they are.
+
+        #WE are looking for GET_DESCRIPTOR with wValue=2 which
+        #enumerates the device configuration, interfaces, and
+        #endPoints.
+        #
+        #We are also looking for SET_CONFIGURATION and SET_INTERFACE
+        (transaction, deviceID, endPoint, bytes)= packets[0]
+
+        #Check for special packets.
+        if transaction != "SETUP":
+            return
+
+        if endPoint!=0:
+            return 
+        
+        bmRequestType=bytes[0]
+        bRequest=bytes[1]
+        wValue=debyteifyLittleEndian( bytes[2:4] )
+        wIndex=debyteifyLittleEndian( bytes[4:6] )
+        wLength=debyteifyLittleEndian( bytes[6:8] )
+        direction=bmRequestType>>7
+        if ((bmRequestType >> 5) & 3) != 0: #Only interested in requests where type=standard.
+            return
+        recipient=bmRequestType & 0xf;
+
+        #Okay, looking for special GET_DESCRIPTOR first
+        if (direction==1) and (recipient==0) and (bRequest==6) and ((wValue>>8)==2): #This is a request for full enumeration.
+            enumerationBytes=packets[1][3]
+            deviceInfo=self.deviceInfo
+
+            bLength=enumerationBytes[0]
+            configurationLength=debyteifyLittleEndian(enumerationBytes[2:4])
+            interfaceCount=enumerationBytes[4]
+            configID=enumerationBytes[5]
+            interfaceBytes=enumerationBytes[bLength:configurationLength]
+            configurationInfo = {}
+            deviceInfo[ configID ] = configurationInfo
+
+            for j in range( interfaceCount ):
+                interfaceID=interfaceBytes[2]
+                alternateSetting=interfaceBytes[3]
+
+                endPointCount=interfaceBytes[4]
+                endPointBytes=interfaceBytes[9:9+endPointCount*7]
+                interfaceInfo = {}
+                if j==0:
+                    configurationInfo[ 0 ] = interfaceInfo #Set default interface.
+
+                configurationInfo[ (interfaceID, alternateSetting) ]=interfaceInfo
+
+                for k in range( endPointCount ):
+                    endPointAddress=endPointBytes[2]
+                    transferType=endPointBytes[3] & 3
+                    if transferType == 0:
+                        cookedType = USBTransaction.CONTROL
+                    elif transferType == 1:
+                        cookedType = USBTransaction.ISOCHRONOUS
+                    elif transferType == 2:
+                        cookedType = USBTransaction.BULK
+                    elif transferType == 3:
+                        cookedType = USBTransaction.INTERRUPT
+
+                    interfaceInfo[ endPointAddress & ~0x80 ]=[endPointAddress, cookedType]
+                    endPointBytes=endPointBytes[7:] #Go to next endPoint.
+                interfaceBytes=interfaceBytes[9+endPointCount*7:] #Go to next interface
+            enumerationBytes=enumerationBytes[configurationLength:] #Go to next configurationa
+
+        #NOW looking for SET_CONFIGURATION and/or SET_INTERFACE
+        elif (direction==0) and (recipient==0) and (bRequest==9):
+            self.currentConfig=wValue & 0xff
+            self.interfaceID=0 #Usually a tuple, but 0 is standin for default interface
+            self.setupEndpointStates()
+        elif (direction==0) and (recipient==1) and (bRequest==0x11):
+            self.interfaceID=(wIndex, wValue & 0xff)
+            self.setupEndpointStates()
+           
+    def setupEndpointStates(self):
+         currentState=self.endPointStates[0]
+
+         self.endPointStates={0:[USBTransaction.CONTROL, currentState[1], 0, currentState[3]]}
+         interfaceInfo=self.deviceInfo[self.currentConfig][self.interfaceID]
+         for endPoint in interfaceInfo.keys():
+             #type, direction, state, storedTripleInfo
+             data=interfaceInfo[endPoint]
+             self.endPointStates[endPoint] = [data[1], 0, data[0]>>7, []]
+         #Okay we are completed.
+
+
 #This is an iterator, which returns CapturePoints as parsed.
 class CapturePointIterator( object ):
     #chunkIterator returns binary blobs as received from the packet dumps
-    #The logical place to get this is from DumpIterator
+    #The logical place to get this is from DumpWiresharkIterator or
+    #DumpVizslaIterator.
+    #
     #capCounter should be set to 1 below the first numbered 
     #packet of the capture
     #
@@ -411,6 +742,7 @@ class CapturePointIterator( object ):
         self.chunkIterator = data
         self.format=format
         self.capCounter=capCounter
+        self.capBase=capCounter
 
     def __iter__(self):
         return self
@@ -418,7 +750,7 @@ class CapturePointIterator( object ):
     def next(self):
         chunk=self.chunkIterator.next()
         self.capCounter += 1
-        capturePoint=CapturePoint(chunk, format=self.format, capCounter=self.capCounter)
+        capturePoint=CapturePoint(chunk, format=self.format, capCounter=self.capCounter, capBase=self.capBase)
         return capturePoint
 
 #This returns completed transactions.

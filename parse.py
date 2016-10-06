@@ -2,9 +2,7 @@
 import sys
 import os
 import usbparse
-from usbparse import USBTransaction, DumpIterator, CapturePointIterator, CompletedTransactionIterator
 from usbparse import CaptureFormatError
-from usbutility import hexdump, debyteify
 import elgato
 import usbfilter
 import traceback
@@ -32,9 +30,9 @@ filenameProxy=None #Use this if you want the output to list a
 capCounterDisplay=False
 
 #Autodetection format list.
-formats=[usbparse.USBPcap, usbparse.Linux] #Make this just one if autodetect screws up.
-                                           #It is possible it won't be caught on the first
-                                           #packet..
+formats=[usbparse.Vizsla, usbparse.USBPcap, usbparse.Linux] #Make this just one if autodetect screws up.
+                                                            #It is possible it won't be caught on the first
+                                                            #packet..
 ######
 #CODE#
 ######
@@ -54,7 +52,10 @@ for formatIndex in range(len(formats)):
                      }
     filterParameters.update( deviceFilterConfiguration.filterParameters )
 
-    inputConfiguration=usbfilter.ConvertDumpFileToCompletedTransactions
+    if format == usbparse.Vizsla:
+        inputConfiguration=usbfilter.ConvertVizslaDumpFileToCompletedTransactions
+    else:
+        inputConfiguration=usbfilter.ConvertWiresharkDumpFileToCompletedTransactions
 
     inputTransactions=inputConfiguration.getFiltered( filename, filterParameters )
     output=deviceFilterConfiguration.getFiltered( inputTransactions, filterParameters )
